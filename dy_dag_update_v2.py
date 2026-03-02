@@ -1,8 +1,3 @@
-"""
-Dynamic Parallel Airflow DAG combining ORIGINAL REST API logic + NEW parallel/dynamic features.
-Supports N tasks from 'nodes' JSON with full validation, REST calls, result aggregation, and live Kafka tracking.
-"""
-
 import json
 import logging
 from datetime import datetime, timedelta, timezone
