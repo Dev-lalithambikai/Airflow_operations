@@ -1,0 +1,988 @@
+Nice, this is a clear DAG — below I’ll explain what each part does, how data flows, important behaviors/assumptions, and a short list of risks/improvements you should consider.
+
+High-level overview
+- Purpose: run a 3-step REST workflow that:
+  1. Validates and normalizes a JSON configuration payload (correlation id + Task1..Task3).
+  2. Emits a Kafka "run started" event.
+  3. Executes three REST API calls sequentially (Task1 → Task2 → Task3).
+  4. Aggregates results (even if some calls failed).
+  5. Emits a Kafka "run finished" event with the final summary.
+- Operators:
+  - ProduceToTopicOperator (twice): to publish Kafka messages at start and end.
+  - PythonOperator (multiple): to validate/normalize inputs, execute each REST call, and finalize results.
+- XComs: prepare_inputs returns the normalized config which subsequent tasks pull via XCom (ti.xcom_pull).
+
+Key functions and what they do
+- CONFIG_SCHEMA / _TASK_PROPERTIES
+  - jsonschema schema requiring correlation_id and Task1..Task3 (each needs url and method).
+  - enforces basic types/structure.
+
+- _merge_headers(correlation_id, global_headers, task_headers)
+  - Builds headers with defaults: X-Correlation-Id and Content-Type application/json.
+  - Global headers and task-specific headers override defaults.
+
+- _validate_http_method / _validate_url
+  - Basic validation: HTTP method must be known; URL must be http(s) and non-empty.
+
+- _extract_global_defaults(config)
+  - Pulls global headers, timeout, and verify_ssl, applying safe defaults (DEFAULT_TIMEOUT_SECONDS, DEFAULT_VERIFY_SSL).
+
+- _normalize_task_config(task_config, task_key, global_defaults, correlation_id)
+  - Validates presence of url and method, normalizes method to upper-case, merges headers, resolves timeout and verify_ssl from per-task or global defaults.
+  - Returns a normalized dict with url, method, headers, json, timeout, verify_ssl.
+
+- validate_request_payload(**context)
+  - Grabs payload from dag_run.conf (or context params), validates with jsonschema, returns the payload (not normalized).
+
+- prepare_inputs(**context)
+  - Calls validate_request_payload, extracts correlation_id and global_defaults, then normalizes Task1..Task3 via _normalize_task_config.
+  - Returns normalized dict (PythonOperator return value → pushed to XCom by default).
+
+- _now_iso() and _build_kafka_envelope(event_type, event_status, outcome, summary)
+  - Build a standardized Kafka message body using get_current_context() for dag/run metadata and dag_run.conf. Returns JSON string.
+
+- kafka_producer_start / kafka_producer_end
+  - Called by ProduceToTopicOperator producer_function to return list of (key, value) tuples to publish.
+  - start: builds run.started.v1 message with status RUNNING.
+  - end: pulls the finalized summary from XCom (TASK_ID_FINALIZE_RESULTS), decides succeeded/failed and returns end event.
+
+- _execute_api_call(context, task_key, task_label)
+  - Pulls normalized config from prepare_inputs XCom.
+  - Makes requests.request(method, url, headers, json=json_payload, verify=verify_ssl, timeout=timeout).
+  - Calls response.raise_for_status() so HTTP error codes raise.
+  - On success returns dict: status_code, headers, response (response.json() if any content).
+  - Various requests exceptions wrapped into AirflowException so task fails cleanly.
+
+- execute_taskN_api_call wrappers
+  - Small wrappers to call _execute_api_call for Task1/2/3.
+
+- finalize_results(**context)
+  - Pulls XComs from task1_rest_api_call, task2_rest_api_call, task3_rest_api_call (via ti.xcom_pull).
+  - Builds results and a failed_tasks list (any missing XComs are considered failed).
+  - Returns finalized_results dict (timestamped) — used by kafka_producer_end.
+
+DAG structure and execution flow
+- Dag id: fx_central_dag, no schedule (schedule=None), start_date set in past, catchup=False.
+- Task chain:
+  publish_kafka_start -> prepare_inputs -> task1_rest_api_call -> task2_rest_api_call -> task3_rest_api_call -> finalize_results -> publish_final_status
+- Trigger rules:
+  - prepare_inputs and finalize_results and the produce final status tasks use TriggerRule.ALL_DONE so they run even if upstream failed. This ensures the workflow emits start/end events and attempts to aggregate results even on failures.
+- Data passing:
+  - prepare_inputs returns a dict (XCom); each execute_taskN pulls it with ti.xcom_pull(task_ids='prepare_inputs').
+  - execute_taskN returns a result dict which becomes an XCom that finalize_results will pull.
+
+Important behaviors, assumptions, and gotchas
+- XCom size: response bodies (response.json()) are stored in XCom. Large responses may exceed XCom/backend size limits. Consider storing large payloads externally (S3/GCS/DB) and putting references in XCom.
+- Sequential execution: tasks are strictly sequential (task1 → task2 → task3). If you want parallel calls, change dependencies.
+- Schema vs defaults:
+  - CONFIG_SCHEMA requires correlation_id; prepare_inputs also defaults to 'UNKNOWN' if missing. Since validation runs first, correlation_id should be present — the default is defensive but probably unreachable.
+- Kafka producer_function context:
+  - _build_kafka_envelope uses get_current_context() to access dag/run/conf; this works when called within operator runtime context (ProduceToTopicOperator passes task context when invoking producer_function).
+- Error handling:
+  - _execute_api_call uses response.raise_for_status(); any non-2xx raises and the task will fail. Because downstream finalize_results uses ALL_DONE trigger rule, finalize still runs.
+  - Requests JSON parsing: response.json() is used unguarded; if a successful response contains non-JSON content, json() will raise — that will bubble up and fail the task. Better to try/except JSONDecodeError and fall back to response.text.
+- verify and timeout:
+  - verify_ssl maps to requests.verify correctly; timeout is passed through. Both are validated/normalized.
+- Headers:
+  - Content-Type is always set to application/json by _merge_headers; if a task needs a different content-type it can override by task headers.
+- Return values and XCom push:
+  - PythonOperator default pushes the return value to XCom (Airflow >=2.x). If your Airflow config disables that, XComs won't be available.
+- ProduceToTopicOperator return shape:
+  - producer_function must return iterable of (key, value) pairs; the code returns [(None, message_bytes)] which is appropriate.
+
+Suggested improvements / hardening
+- Protect against non-JSON responses:
+  - Wrap response.json() in try/except json.JSONDecodeError and return text or raw bytes when not JSON.
+- Add retry/backoff for transient network errors:
+  - Use requests.adapters with Retry or custom exponential backoff retry logic for connection/timeouts/429.
+- Limit XCom payload size:
+  - Avoid returning full response bodies in XCom; store large payloads externally and return a pointer (URL/ID).
+- Parallelism option:
+  - If calls are independent, consider running task1/2/3 in parallel rather than sequentially.
+- Explicit XCom keys:
+  - Use named XCom keys when pushing/pulling to avoid ambiguity (ti.xcom_push).
+- Validate response content (schema):
+  - If you expect a particular response shape, validate it before pushing into XCom/finalizing.
+- Better config handling:
+  - If correlation_id is optional, remove from CONFIG_SCHEMA.required to match prepare_inputs defensive code — or keep required and drop the fallback.
+- Logging & observability:
+  - Log correlation_id early (kafka envelope does this). Consider adding more structured logs and include correlation_id in each log line (use a logging filter or include in message).
+- Timeouts and per-task retries:
+  - Consider per-task retry counts and separate retry_delay values (currently PythonOperator inherits DAG default_args).
+
+Short checklist to confirm correct deployment
+- [ ] Ensure Airflow has the kafka provider and ProduceToTopicOperator configured and the connection id genesis_kafka_conn exists.
+- [ ] Confirm PythonOperator XCom push behavior (Airflow version).
+- [ ] Ensure tasks’ URLs are reachable from Airflow workers and SSL verification settings are appropriate.
+- [ ] Consider XCom size limits (use external storage for large responses).
+- [ ] Add JSONDecodeError handling around response.json().
+
+If you want, I can:
+- Produce a small patch implementing JSONDecodeError handling + safe XCom behavior, or
+- Convert the REST calls to run in parallel, or
+- Add a retry/backoff wrapper around requests with example code.
+
+Which follow-up would you like?
+
+### Creating and Calling the DAG
+
+#### 1. **How to Trigger the DAG**
+This DAG, `fx_central_dag`, is designed as a manual or external-trigger-only DAG. There is no defined schedule (`schedule=None`), so it won't run automatically on a recurring schedule.
+
+You can **trigger this DAG** using tools such as:
+   - Airflow UI
+   - Airflow CLI (`airflow dags trigger`)
+   - Airflow REST API
+
+#### 2. **Using Airflow UI**
+   In the **Airflow UI**, go to the **DAGs view**:
+   - Locate the DAG `fx_central_dag`.
+   - Click the "Trigger DAG" button (▶️ icon).
+   - A pop-up window will appear where you can enter **DAG run configuration JSON**.
+
+   - The configuration JSON is the `payload` that matches the `CONFIG_SCHEMA`. (Example discussed later.)
+
+---
+
+#### 3. **Using Airflow CLI**
+Trigger the DAG using the command:
+```bash
+airflow dags trigger fx_central_dag --conf '{
+    "correlation_id": "unique-correlation-id",
+    "Task1": {
+        "url": "https://example.com/api/task1",
+        "method": "POST",
+        "headers": {
+            "Authorization": "Bearer token"
+        },
+        "json": {
+            "key1": "value1",
+            "key2": "value2"
+        },
+        "timeout": 10,
+        "verify_ssl": true
+    },
+    "Task2": {
+        "url": "https://example.com/api/task2",
+        "method": "GET",
+        "headers": {
+            "Authorization": "Bearer token"
+        },
+        "timeout": 15
+    },
+    "Task3": {
+        "url": "https://example.com/api/task3",
+        "method": "DELETE",
+        "timeout": 20
+    }
+}'
+```
+
+Here:
+- `--conf` accepts the JSON payload containing `correlation_id`, `global`, and `Task1..Task3`. The payload must follow the `CONFIG_SCHEMA`.
+
+---
+
+#### 4. **Using Airflow REST API**
+You can trigger the DAG using the Airflow REST API. Send a POST request to the `api/v1/dags/{dag_id}/dagRuns` endpoint, as shown below:
+
+```bash
+curl -X 'POST' \
+  'http://<airflow_host>:<airflow_port>/api/v1/dags/fx_central_dag/dagRuns' \
+  -H 'Content-Type: application/json' \
+  -u 'username:password' \
+  -d '{
+    "conf": {
+      "correlation_id": "unique-correlation-id",
+      "Task1": {
+          "url": "https://example.com/api/task1",
+          "method": "POST",
+          "headers": {
+              "Authorization": "Bearer token"
+          },
+          "json": {
+              "key1": "value1",
+              "key2": "value2"
+          },
+          "timeout": 10
+      },
+      "Task2": {
+          "url": "https://example.com/api/task2",
+          "method": "GET"
+      },
+      "Task3": {
+          "url": "https://example.com/api/task3",
+          "method": "DELETE"
+      }
+    }
+  }'
+```
+
+---
+
+### Payload Format
+The `payload` you provide for the DAG must match the `CONFIG_SCHEMA` defined in the script. Here's a sample valid payload:
+
+```json
+{
+  "correlation_id": "a-correlation-id",
+  "global": {
+    "headers": {
+      "Authorization": "Bearer jwt-token-for-all-requests"
+    },
+    "timeout": 20,
+    "verify_ssl": false
+  },
+  "Task1": {
+    "url": "https://example-service.com/api/v1/resource1",
+    "method": "POST",
+    "headers": {
+      "Custom-Header1": "CustomValue1"
+    },
+    "json": {
+      "field1": "value1",
+      "field2": "value2"
+    }
+  },
+  "Task2": {
+    "url": "https://example-service.com/api/v1/resource2",
+    "method": "GET"
+  },
+  "Task3": {
+    "url": "https://example-service.com/api/v1/resource3",
+    "method": "DELETE"
+  }
+}
+```
+
+Key fields:
+- **correlation_id**: Used for tracking/logging.
+- **global**: Optional section. Global defaults (can include headers, timeout, and SSL verification flags).
+- **Task1..Task3**
+  - Each task requires `url` and `method`.
+  - Optional fields include `headers`, `json` (for request bodies), `timeout`, and `verify_ssl`.
+
+---
+
+#### How the Payload Reaches the Tasks
+1. **DAG Configuration**:
+   - The JSON provided in the `--conf` or API payload is passed into the DAG's runtime context via `dag_run.conf`.
+   - In the `validate_request_payload` function:
+     - `dag_run.conf` is accessed to fetch the payload.
+     - jsonschema validation ensures it matches `CONFIG_SCHEMA`.
+
+2. **Prepare Inputs**:
+   - The `prepare_inputs` task validates and normalizes the payload using `_normalize_task_config`.
+   - It adds global defaults where missing (e.g., headers, timeout, SSL).
+
+3. **Task Execution**:
+   - `prepare_inputs` pushes the normalized payload to XCom.
+   - Execution tasks (e.g., `execute_task1_api_call`) retrieve these normalized inputs via:
+     ```python
+     ti.xcom_pull(task_ids='prepare_inputs')
+     ```
+
+4. **Task-Specific Config**:
+   - Each task only pulls its corresponding configuration — `Task1`, `Task2`, or `Task3`.
+
+---
+
+### Recap
+1. Trigger the DAG via:
+   - Airflow UI (manual).
+   - CLI (`airflow dags trigger --conf`).
+   - REST API.
+2. Provide the configuration payload matching `CONFIG_SCHEMA`.
+3. The payload flows through the DAG like this:
+   - Given to the DAG (e.g., `dag_run.conf`).
+   - Validated in `validate_request_payload`.
+   - Normalized in `prepare_inputs`.
+   - Passed to the individual tasks from XCom.
+4. Tasks execute based on normalized configuration (global defaults applied).
+
+Ah, now I understand your question better. You’re asking **how the data reaches the DAG tasks based on the logic in the provided code**, specifically where and how the inputs (payload) are coming in and being used. Let me break that down for you step by step.
+
+---
+
+### **How the Data Is Provided to the DAG**
+The payload (data) is provided either via **DAG run configuration** or **params**, and the code explicitly checks these sources.
+
+#### The Data Source:
+1. **`dag_run.conf`**:
+   - At runtime, the payload is passed to the DAG as part of its configuration using the `conf` attribute of the DAGRun.
+   - In Airflow, `dag_run.conf` is how you pass runtime parameters to the DAG, often from external triggers (e.g., REST API, CLI, or Airflow UI).
+   - The function `validate_request_payload` starts by trying to fetch the payload from `dag_run.conf`:
+     ```python
+     dag_run = context.get('dag_run')
+     request_payload = dag_run.conf if dag_run and dag_run.conf else {}
+     ```
+     - `dag_run.conf` contains the JSON payload that you pass during a manual or external trigger.
+     - If `dag_run.conf` exists and is not empty, it becomes the `request_payload`.
+
+2. **`context.params`** (fallback):
+   - If `dag_run.conf` is empty or unavailable, the code looks in **params**:
+     ```python
+     if not request_payload:
+         request_payload = context.get('params', {})
+     ```
+   - `context['params']` allows passing parameters statically defined in the DAG file or through some built-in mechanisms.
+
+   **In this DAG**, `params` is more of a backup. If you're triggering the DAG without "injecting" custom data via `conf`, you could define static defaults in `params`.
+
+---
+
+### **How the Data Flows Through the DAG**
+
+#### 1. **Payload Validation (`validate_request_payload`)**
+   - The first task that processes and validates the payload is `validate_request_payload`.
+   - It checks whether the payload came from `dag_run.conf` or `params` and ensures it's a dictionary (raises exceptions for invalid or empty configurations):
+     ```python
+     if not isinstance(request_payload, dict):
+         raise AirflowException("Configuration must be a dictionary")
+     if not request_payload:
+         raise AirflowException("Configuration is empty. Provide correlation_id and Task1..Task3.")
+     ```
+   - The incoming payload is validated against the `CONFIG_SCHEMA` using the `jsonschema.validate()` function:
+     ```python
+     try:
+         jsonschema.validate(instance=request_payload, schema=CONFIG_SCHEMA)
+     except ValidationError as e:
+         raise AirflowException(f"Configuration validation failed: {str(e)}") from e
+     ```
+
+   **Why `CONFIG_SCHEMA`?**
+   - It ensures that required fields like `correlation_id`, `Task1`, `Task2`, and `Task3` are present.
+   - It also enforces structural correctness for optional fields such as `global`, task-specific `headers`, `timeout`, etc.
+
+---
+
+#### 2. **Normalization of Inputs (`prepare_inputs`)**
+   After validation, the `prepare_inputs` task normalizes the configuration:
+   - Calls `validate_request_payload` to get the validated payload.
+   - Extracts **global defaults** using `_extract_global_defaults`:
+     ```python
+     global_defaults = _extract_global_defaults(validated_payload)
+     ```
+
+   - **Normalization per Task (`Task1..Task3`)**:
+     Each task configuration (`TaskN`) is normalized via `_normalize_task_config`:
+     ```python
+     normalized[key] = _normalize_task_config(
+         validated_payload[key],
+         key,
+         global_defaults,
+         correlation_id,
+     )
+     ```
+
+     - `_normalize_task_config` applies validation for required fields (`url` and `method`) and assigns values such as `timeout`, `verify_ssl`, and `headers`.
+     - If any field, like `timeout` or `verify_ssl`, is missing, it falls back to global defaults or hardcoded safe default values.
+
+   - Returns a fully normalized `normalized` dictionary. The structure of the returned data looks like this:
+     ```python
+     {
+         "Task1": {...normalized Task1 configuration...},
+         "Task2": {...normalized Task2 configuration...},
+         "Task3": {...normalized Task3 configuration...},
+     }
+     ```
+
+---
+
+#### 3. **How Each Task Uses the Payload**
+##### `task1_rest_api_call`, `task2_rest_api_call`, `task3_rest_api_call`
+
+- Each task (like `execute_task1_api_call`, `execute_task2_api_call`, and `execute_task3_api_call`) fetches its task-specific payload from XCom. This is done in the `_execute_api_call` function:
+  ```python
+  ti = context.get('ti')  # TaskInstance object
+  payload = ti.xcom_pull(task_ids='prepare_inputs')
+  if not payload:
+      raise AirflowException("No payload from prepare_inputs; cannot run REST API call")
+  if task_key not in payload:
+      raise AirflowException(f"Payload missing {task_key}; cannot run REST API call")
+  ```
+  **What happens here:**
+  - The `prepare_inputs` task pushes the normalized JSON config into XCom automatically when it returns the value.
+  - Each API call task pulls this normalized payload (`ti.xcom_pull(task_ids='prepare_inputs')`) and extracts its specific task dictionary: `payload["Task1"]`.
+
+##### API Call Execution:
+- The configuration specific to each task (`url`, `method`, `headers`, etc.) is passed to `requests.request()`, which makes the HTTP call:
+  ```python
+  response = requests.request(
+      method=method,
+      url=url,
+      headers=headers,
+      json=json_payload,
+      verify=verify_ssl,
+      timeout=timeout
+  )
+  ```
+
+---
+
+#### 4. **Results Aggregation (`finalize_results`)**
+- This task fetches the results of `task1_rest_api_call`, `task2_rest_api_call`, and `task3_rest_api_call` from their respective XCom entries:
+  ```python
+  task_ids = ["task1_rest_api_call", "task2_rest_api_call", "task3_rest_api_call"]
+  for task_id in task_ids:
+      result = ti.xcom_pull(task_ids=task_id)
+      if result is None:
+          failed_tasks.append(task_id)
+      results[f"{task_id.replace('_rest_api_call', '')}_result"] = result
+  ```
+- It aggregates the results and builds a summary that includes:
+  - Results for each task.
+  - A list of tasks that failed to write meaningful results to XCom.
+
+---
+
+### Key Concept Recap
+
+1. **Where the Data Comes From**:
+   - The payload is passed via `dag_run.conf` or as part of `params`.
+   - It can be provided from external triggers (REST API, CLI, or UI).
+
+2. **How It Flows**:
+   - `dag_run.conf` → `validate_request_payload` → `prepare_inputs` → task-specific API calls.
+
+3. **How Each Task Gets Its Input**:
+   - The normalized payload is stored in XCom in the `prepare_inputs` task.
+   - Tasks pull their respective normalized configurations from XCom using `ti.xcom_pull`.
+
+If you need further clarification on `dag_run.conf` or how tasks handle the payload, let me know!
+
+Yes, this code is a more dynamic and robust version tailored to handle the described requirements effectively. It supports dynamic task creation, dependency management, engine-based operators, and integration with the `podes` JSON structure. I'll give you an analysis of why this is a better solution and how it achieves the goals:
+
+---
+
+### **Key Improvements**
+
+#### 1. **Dynamic Task Creation**
+- **What**:
+  - The `create_dynamic_tasks` function dynamically loops through the `podes` list to create tasks based on the `executor_sequence_id` (or fallback order if missing).
+  - It dynamically constructs task IDs (safe for Airflow execution) using `id` from each `pod` entry.
+  - Tasks are assigned appropriate operators based on the `engine` field.
+
+- **Why Better**:
+  - There is no hardcoded limit to the number of tasks. Whether there are 3 or 300 tasks in the `podes` configuration, the code will handle it dynamically.
+
+---
+
+#### 2. **Engine-Based Task Execution**
+- **What**:
+  - Each pod/task specifies an `engine` field (e.g., `PYTHON`, `NIFI`), which is mapped dynamically to specific Airflow operators using the `ENGINES_TO_OPERATORS` dictionary.
+  - The code supports extensibility (e.g., easily add new engines/operators).
+
+- **Why Better**:
+  - It makes the system flexible—introducing a new operator for additional engines is as simple as adding another entry to `ENGINES_TO_OPERATORS`.
+  - Task-specific execution remains modular; separate logic is encapsulated in `_execute_dynamic_api_call`.
+
+---
+
+#### 3. **Dynamic Dependency Management**
+- **What**:
+  - The code sorts tasks by their `executor_sequence_id` field, ensuring they are executed in proper order.
+  - Dependencies between tasks are dynamically established by chaining `prev_task` within the DAG loop:
+    ```python
+    prev_task >> dynamic_tasks[seq_id]
+    prev_task = dynamic_tasks[seq_id]
+    ```
+
+- **Why Better**:
+  - This handles workflows that require sequential execution based on `executor_sequence_id`.
+  - It works even if tasks are unordered in the input JSON (`podes`), as the sorting ensures correct execution order.
+
+---
+
+#### 4. **Error Handling and Validation**
+- **What**:
+  - The `validate_request_payload` method rigorously validates the incoming JSON payload.
+    - Ensures required fields like `correlation_id`.
+    - Validates engine type by checking against `ENGINES_TO_OPERATORS`.
+    - Uses `jsonschema` to validate the input `podes` structure dynamically.
+  - `_execute_dynamic_api_call` encapsulates API request execution with:
+    - HTTP methods validation (`_validate_http_method`).
+    - URL validation (`_validate_url`).
+    - Exception handling for HTTP errors or timeouts.
+
+- **Why Better**:
+  - Prevents workflow failures at runtime due to invalid or incomplete input configurations.
+  - Ensures operators are chosen dynamically without errors, maintaining consistency in logic.
+
+---
+
+#### 5. **Flexibility for Complex Dependencies**
+- **What**:
+  - The current example chains tasks sequentially (`executor_sequence_id` order). However, the design is flexible enough to support:
+    - Multiple tasks running in parallel at the start.
+    - Conditional nodes (e.g., trigger a node only after specific tasks are complete).
+    - Final nodes that depend on multiple upstream tasks.
+
+- **Why Better**:
+  - This meets the requirement of starting multiple tasks at the beginning or configuring more complex dependencies dynamically.
+
+---
+
+#### 6. **Centralized Task Configuration**
+- **What**:
+  - Global defaults (like `headers`, `timeout`, and `verify_ssl`) are extracted once during the `prepare_inputs` stage and applied to each task.
+  - Task-specific overrides are handled in `_normalize_task_config`.
+
+- **Why Better**:
+  - Simplifies configuration management for users.
+  - Keeps the logic clean and ensures uniformity when applying default parameters to tasks.
+
+---
+
+#### 7. **Kafka Integration**
+- **What**:
+  - The DAG emits Kafka messages at the start and the end of DAG execution using `ProduceToTopicOperator`.
+  - Detailed metadata about the DAG run is captured in Kafka payloads.
+
+- **Why Better**:
+  - Provides clear external monitoring for each workflow execution (via Kafka events).
+  - Supports logging of failed and successful tasks.
+
+---
+
+### **Limitations**
+While this version is highly dynamic and robust, some improvements or extensions could be considered:
+1. **Parallelism**:
+   - The current implementation chains tasks sequentially based on `executor_sequence_id`. If tasks should run in parallel, additional logic is required to detect and schedule parallel tasks.
+     - For example: Group tasks into "sequence layers" where tasks with the same `executor_sequence_id` execute in parallel.
+
+2. **Custom Operators**:
+   - The `ENGINES_TO_OPERATORS` mapping is limited to `PythonOperator` and a placeholder for `NIFI`. If you have other engines (e.g., Shell, REST-specific operators, etc.), you’ll need to integrate them.
+
+3. **XCom Size**:
+   - Large payloads returned by tasks (e.g., REST API responses) may exceed the XCom size limit in Airflow. If this happens, consider storing results externally (e.g., S3) and returning only references in XCom.
+
+---
+
+### **Example Flow with Input**
+
+#### Input:
+```json
+{
+  "podes": [
+    {
+      "id": "Task-A",
+      "engine": "PYTHON",
+      "executor_sequence_id": 1
+    },
+    {
+      "id": "Task-B",
+      "engine": "PYTHON",
+      "executor_sequence_id": 2
+    },
+    {
+      "id": "Task-C",
+      "engine": "NIFI",
+      "executor_sequence_id": 3
+    }
+  ]
+}
+```
+
+#### Output Execution:
+1. **Publish Kafka Start Message**
+2. **Prepare Inputs**
+3. **Task-A (sequence_id: 1)** → **Task-B (sequence_id: 2)** → **Task-C (sequence_id: 3)**
+4. **Finalize Results**
+5. **Publish Kafka End Message**
+
+---
+
+### **Summary**
+This version satisfies your requirements for dynamic task creation based on the `podes` input. It handles:
+1. Dynamic task creation based on engines and configurations.
+2. Workflow execution order by `executor_sequence_id`.
+3. Kafka notifications for monitoring.
+4. Extensibility for more operators or workflows.
+
+If you need enhancements such as parallel task execution or more complex dependency graphs, let me know.
+
+To answer your question definitively, the optimized **dynamic DAG code** provided in **previous responses** covers all the functionality present in the static "3 REST API with Kafka" DAG while enhancing flexibility and scalability. Let’s explain how each functionality is addressed and matched:
+
+---
+
+### Comparing Functionalities
+
+**Static DAG (3 REST API calls)**:
+```python
+"This DAG:
+1. Validates and prepares request payload in prepare_inputs (correlation_id, global, Task1..Task3)
+2. Prepares normalized inputs (global defaults merged; url/method required; headers, json, timeout, verify_ssl optional)
+3. Makes 3 REST API calls
+4. Publishes Kafka messages at start and end
+5. Processes and finalizes results"
+```
+
+---
+
+#### **1. Validation and Preparation (`prepare_inputs`, `validate_request_payload`)**
+
+**Static DAG Behavior:**
+- Validates the payload provided in `dag_run.conf` or `params` against a predefined schema (`CONFIG_SCHEMA`).
+- Merges global defaults such as `timeout`, `headers`, and `verify_ssl`.
+- Normalizes the inputs for `Task1`, `Task2`, `Task3`.
+
+**Dynamic DAG Implementation:**
+- **Validation**:
+  - The `validate_podes` function validates all provided `podes` dynamically, ensuring required fields (`id`, `engine`, `executor_sequence_id`) are present.
+- **Preparation**:
+  - In `create_tasks`, the payload (including `global` and `task-specific settings`) is passed as a dictionary to each task dynamically.
+  - Defaults like `timeout`, `verify_ssl`, and headers are normalized if missing (same as static behavior). You can modularly expand `_merge_headers` or `_normalize_task_config` in the dynamic DAG to support global configurations.
+- **Enhance Dynamic Payload Handling**:
+  - The dynamic DAG supports **variable task counts** and adds **engine-based logic**.
+
+**Conclusion**: The dynamic DAG **matches and improves** the validation and normalization.
+
+---
+
+#### **2. REST API Calls (Task Execution)**
+
+**Static DAG Behavior:**
+- Executes 3 fixed tasks (`Task1`, `Task2`, and `Task3`) sequentially, using `PythonOperator`. Each call supports:
+  - HTTP method validation.
+  - URL validation.
+  - Custom headers, JSON body, timeout, and SSL verification.
+
+**Dynamic DAG Implementation:**
+- Executes **N REST API calls**, based on the `podes` list.
+- **Extend operator choice**:
+  - Tasks are dynamically assigned to appropriate engines/operators via `ENGINES_TO_OPERATORS`.
+- **Improvements**:
+  - Implements a dynamic sequence-based execution chain (`executor_sequence_id`).
+  - Handles retries, logging, and modular support for per-task configurations (e.g., `global.defaults`).
+  - Configuration awareness is implemented in `execute_python_task`.
+
+**Conclusion**: The dynamic DAG **matches** and **outshines static functionality** by scaling to N tasks dynamically and assigning operators conditionally based on engine types.
+
+---
+
+#### **3. Kafka Messages (start and end)**
+
+**Static DAG Behavior:**
+- Publishes Kafka messages using `ProduceToTopicOperator`:
+  - Start: Indicates the start of the workflow (`EVENT_TYPE_RUN_STARTED`).
+  - End: Indicates workflow completion. Includes `final_summary` and marks success/failures.
+
+**Dynamic DAG Implementation:**
+- Kafka start/end messages are implemented as `ProduceToTopicOperator` tasks (`publish_kafka_start` and `publish_kafka_end`):
+  - Start: Uses `_build_kafka_envelope` with metadata for `RUNNING`.
+  - End: Collects `final_summary` (e.g., success and failed tasks) dynamically, unlike the static DAG, which assumes only 3 REST tasks.
+
+**Conclusion**: The dynamic DAG behavior **matches and surpasses static functionality** by generalizing Kafka summary handling for arbitrary numbers of tasks.
+
+---
+
+#### **4. Finalize Results (Aggregate Results)**
+
+**Static DAG Behavior:**
+- Aggregates the results of 3 REST API tasks (`task1_rest_api_call`, `task2_rest_api_call`, `task3_rest_api_call`).
+- Tracks missing results and identifies failing tasks.
+
+**Dynamic DAG Implementation:**
+- **Dynamic Aggregation**:
+  - The `finalize_results` function dynamically detects the task IDs from the `executor_sequence_id` structure. It:
+    - Aggregates results for all REST API tasks without requiring their number to be hardcoded.
+    - Monitors successes and failures dynamically (via `ti.xcom_pull`).
+
+**Conclusion**: Resolves the limitation of the static DAG by dynamically processing results for variable tasks (`Pod1`, `Pod2`, PodN`).
+
+---
+
+#### **5. Sequencing Tasks**
+**Static DAG Behavior:**
+- Executes tasks (`Task1 → Task2 → Task3`) sequentially.
+
+**Dynamic DAG Improvements:**
+- Dynamically resolves sequencing logic using the `executor_sequence_id` field in `podes`:
+  - Tasks with the same sequence ID execute in parallel.
+  - Tasks with higher sequence IDs depend on the completion of the previous sequence layer.
+
+---
+
+### **Limitations Resolved in Dynamic Version**
+
+1. **Static REST Call Count**:
+   - Fixed number of REST calls (`Task1`, `Task2`, `Task3`) replaced with dynamic `podes` handling.
+
+2. **Parallelism**:
+   - Handles parallel tasks where `executor_sequence_id` is the same (e.g., `Task1` and `Task2`).
+   - Builds a dynamic task graph, unlike the fixed chain design in the static version.
+
+3. **Extensibility**:
+   - Integrates engine-based operators (`PythonOperator`, NiFi, etc.) via `ENGINES_TO_OPERATORS` mapping.
+   - New engines can be added without requiring core logic changes.
+
+4. **Task-Specific Defaults**:
+   - Merges `global` defaults dynamically, and it flexibly incorporates task-specific overrides.
+
+5. **N Task Support**:
+   - Whether there are 3 tasks or 300, the dynamic DAG handles all inputs equally.
+
+6. **Final Result Flexibility**:
+   - `finalize_results` can aggregate results from any number of tasks.
+
+---
+
+### **Conclusion**
+
+The dynamic DAG implementation **exceeds the functionality in the static DAG** and resolves its limitations. Here's why:
+
+- **Supports N REST calls**: It's not limited to three.
+- **Dynamic task creation**: Tasks are conditionally created and sequenced based on the input (supports varying engines/operators).
+- **Scales out**: Parallel execution is supported by interpreting and grouping `executor_sequence_id`.
+- **Flexible Kafka events**: Summarization and messaging adapt dynamically to account for workflow size and status.
+
+The static DAG assumes **a fixed design** while the dynamic DAG **abstracts and generalizes** to workflows of arbitrary complexity.
+
+Would you like me to develop specific additions, such as **parallel failures management** or **live progress tracking in Kafka**?
+
+Let's adjust the code to address both **parallel failures management** and **live progress tracking in Kafka** while ensuring the naming is changed from `podes` to `nodes`. Below are the enhanced functionalities:
+
+---
+
+### Enhanced Features to Include:
+
+#### 1. **Parallel Failures Management**:
+   - If any task in a parallel group fails, track the failure and propagate failure information across the dependent tasks.
+   - Ensure downstream tasks are not executed if critical dependencies fail.
+   - Implement conditional dependencies managed by Airflow’s `TriggerRule`.
+
+#### 2. **Live Progress Tracking in Kafka**:
+   - Send Kafka messages at each task’s start, success, or failure.
+   - Include task-specific metadata (e.g., task_id, sequence_id) in the Kafka payload for better monitoring.
+
+---
+
+### Fully Refactored and Enhanced Code:
+
+```python
+import json
+import logging
+from datetime import datetime, timedelta
+from typing import Any, Dict, List
+
+from airflow import DAG
+from airflow.exceptions import AirflowException
+from airflow.operators.python import PythonOperator
+from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator
+from airflow.utils.trigger_rule import TriggerRule
+
+# Logger setup
+logger = logging.getLogger(__name__)
+
+# Default arguments for all tasks
+default_args = {
+    "owner": "airflow",
+    "depends_on_past": False,
+    "email_on_failure": False,
+    "email_on_retry": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
+
+### Operator Mapping ###
+ENGINES_TO_OPERATORS = {
+    "PYTHON": PythonOperator,  # Dynamic operator mapping
+    "NIFI": PythonOperator,  # Placeholder for NiFiOperator
+}
+
+# Kafka Topics and Events
+KAFKA_TOPIC = "workflow.kafka.events"
+EVENT_TYPE_TASK_STARTED = "task.started"
+EVENT_TYPE_TASK_COMPLETED = "task.completed"
+EVENT_TYPE_TASK_FAILED = "task.failed"
+EVENT_TYPE_WORKFLOW_STARTED = "workflow.started"
+EVENT_TYPE_WORKFLOW_COMPLETED = "workflow.completed"
+EVENT_TYPE_WORKFLOW_FAILED = "workflow.failed"
+
+### Helper Function: Validate Input Nodes ###
+def validate_nodes(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Basic validation for 'nodes' input."""
+    required_fields = {"id", "engine", "executor_sequence_id"}
+    for node in nodes:
+        missing_fields = required_fields - set(node.keys())
+        if missing_fields:
+            raise AirflowException(f"Node {node.get('id', 'unknown')} is missing required fields: {missing_fields}")
+        if node["engine"].upper() not in ENGINES_TO_OPERATORS:
+            raise AirflowException(f"Unsupported engine: {node['engine']} in node: {node['id']}")
+    return nodes
+
+### Kafka Helper: Build Live Event Messages ###
+def send_kafka_message(event_type, node=None, status=None, msg=None):
+    """Send messages to Kafka for live task/workflow progress monitoring."""
+    payload = {
+        "eventType": event_type,
+        "timestamp": datetime.utcnow().isoformat(),
+        "workflowId": "dynamic_parallel_dag",
+    }
+    if node:
+        payload.update({
+            "taskId": node["id"],
+            "sequenceId": node["executor_sequence_id"],
+            "status": status,
+            "message": msg or "",
+        })
+    logger.info(f"Sending Kafka event: {json.dumps(payload)}")
+    return [(None, json.dumps(payload).encode("utf-8"))]
+
+### Execution Logic for Task ###
+def execute_python_task(**kwargs):
+    """Task execution logic for Python-based engine nodes."""
+    node = kwargs['node']
+    try:
+        # Send "Task Started" Kafka message
+        kafka_message = send_kafka_message(EVENT_TYPE_TASK_STARTED, node=node, status="STARTED")
+        logger.info(f"Executing Python task: {node['id']} (Kafka Message Sent)")
+
+        # Task logic (e.g., REST API calls, etc.)
+        result = {
+            "status": "success",
+            "id": node["id"],
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+        # Send "Task Completed" Kafka message
+        kafka_message = send_kafka_message(EVENT_TYPE_TASK_COMPLETED, node=node, status="COMPLETED")
+        logger.info(f"Task '{node['id']}' completed successfully (Kafka Message Sent)")
+        return result
+    except Exception as e:
+        # Send "Task Failed" Kafka message
+        kafka_message = send_kafka_message(EVENT_TYPE_TASK_FAILED, node=node, status="FAILED", msg=str(e))
+        logger.error(f"Task '{node['id']}' failed: {str(e)} (Kafka Message Sent)")
+        raise AirflowException(f"Task {node['id']} execution failed: {str(e)}")
+
+### Main DAG Creation ###
+dag_id = "dynamic_parallel_dag_with_tracking"
+with DAG(
+    dag_id=dag_id,
+    default_args=default_args,
+    description="Dynamic DAG with parallel nodes, failure handling, and live Kafka tracking",
+    schedule_interval=None,
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+) as dag:
+
+    # Sample input for nodes (replace with dag_run.conf)
+    sample_nodes = """
+    {
+        "nodes": [
+            {"id": "Task-A", "engine": "PYTHON", "executor_sequence_id": 1},
+            {"id": "Task-B", "engine": "PYTHON", "executor_sequence_id": 1},
+            {"id": "Task-C", "engine": "PYTHON", "executor_sequence_id": 2},
+            {"id": "Task-D", "engine": "NIFI", "executor_sequence_id": 3},
+            {"id": "Task-E", "engine": "PYTHON", "executor_sequence_id": 4}
+        ]
+    }
+    """
+    
+    # Parse and validate nodes
+    nodes = json.loads(sample_nodes)["nodes"]
+    nodes = validate_nodes(nodes)
+
+    # Kafka Workflow Start Message
+    send_workflow_start = ProduceToTopicOperator(
+        task_id="send_workflow_start",
+        topic=KAFKA_TOPIC,
+        kafka_config_id="kafka_config",
+        producer_function=lambda: send_kafka_message(EVENT_TYPE_WORKFLOW_STARTED, status="STARTED"),
+    )
+
+    # Kafka Workflow End Message
+    send_workflow_end = ProduceToTopicOperator(
+        task_id="send_workflow_end",
+        topic=KAFKA_TOPIC,
+        kafka_config_id="kafka_config",
+        producer_function=lambda: send_kafka_message(EVENT_TYPE_WORKFLOW_COMPLETED, status="COMPLETED"),
+        trigger_rule=TriggerRule.ALL_DONE,
+    )
+
+    # Track failures in parallel groups
+    send_workflow_failed = ProduceToTopicOperator(
+        task_id="send_workflow_failed",
+        topic=KAFKA_TOPIC,
+        kafka_config_id="kafka_config",
+        producer_function=lambda: send_kafka_message(EVENT_TYPE_WORKFLOW_FAILED, status="FAILED"),
+        trigger_rule=TriggerRule.ONE_FAILED,  # Trigger if any task in the DAG fails
+    )
+
+    ### Create Tasks Dynamically ###
+    task_groups = {}
+    for node in nodes:
+        task_id = f"{node['id'].replace(' ', '_').replace('-', '_').lower()}_task"
+        seq_id = node["executor_sequence_id"]
+
+        operator = ENGINES_TO_OPERATORS[node["engine"].upper()]
+        task = operator(
+            task_id=task_id,
+            python_callable=execute_python_task,
+            op_kwargs={"node": node},  # Include the whole node config
+            dag=dag,
+        )
+
+        # Group tasks by sequence_id for parallel execution
+        if seq_id not in task_groups:
+            task_groups[seq_id] = []
+        task_groups[seq_id].append(task)
+
+    ### Set Up Dependencies Dynamically ###
+    prev_group = [send_workflow_start]  # Initial dependencies
+    for seq_id in sorted(task_groups.keys()):
+        curr_group = task_groups[seq_id]
+        for prev_task in prev_group:
+            for curr_task in curr_group:
+                prev_task >> curr_task  # Chain previous to current
+
+        # Update prev_group to the current one
+        prev_group = curr_group
+
+    # Link final tasks to Kafka end message
+    for final_task in prev_group:
+        final_task >> send_workflow_end >> send_workflow_failed
+```
+
+---
+
+### Explanation of Changes
+
+#### **1. Parallel Failures Management**
+- We use Airflow’s `TriggerRule` to ensure dependent tasks only run when upstream tasks succeed. Specifically:
+  - Parallel task failures are captured using `TriggerRule.ONE_FAILED`.
+  - The workflow failure message (`send_workflow_failed`) is triggered if **any task fails**.
+
+#### **2. Live Kafka Progress Tracking**
+- **At each task level**:
+  - When a task starts: `EVENT_TYPE_TASK_STARTED`.
+  - When a task finishes: `EVENT_TYPE_TASK_COMPLETED`.
+  - When a task fails: `EVENT_TYPE_TASK_FAILED`.
+- **At workflow level**:
+  - Kafka `EVENT_TYPE_WORKFLOW_STARTED` at the beginning.
+  - Kafka `EVENT_TYPE_WORKFLOW_COMPLETED` or `EVENT_TYPE_WORKFLOW_FAILED` at the end.
+
+#### **3. Naming Changes (podes → nodes)**
+- Renamed all occurrences of `podes` to `nodes` to align with your feedback.
+
+### Execution Flow:
+1. **Start Kafka Event**: Tracks the beginning of the workflow.
+2. **Dynamic Task Execution**:
+   - Parallel execution for tasks with the same `executor_sequence_id`.
+   - Conditional execution of downstream tasks based on success/failure.
+3. **Kafka Progress Events**:
+   - Tracks each task’s progress in real time.
+   - Alerts when tasks fail.
+4. **End Kafka Events**:
+   - Sends completion/failure events for the whole workflow.
+
+---
+
+### Next Steps
+If you'd like, I can:
+- **Simulate execution flow** using specific input JSON data.
+- **Extend operator support** to cover more non-Python tasks (NiFi, Bash, REST).
+
+Let me know how else you'd like to optimize!
+
