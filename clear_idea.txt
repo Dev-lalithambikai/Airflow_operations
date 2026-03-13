@@ -1,0 +1,205 @@
+
+
+## 🌐 The Big Picture — What Are They Building?
+
+Imagine a company has a system where users can **design and run automated workflows** from a website (UI). Think of a workflow like a recipe — Step 1 → Step 2 → Step 3, each step depending on the previous one.
+
+These workflows are called **DAGs** (Directed Acyclic Graphs) and they run on a tool called **Apache Airflow**. The team's job is to make sure that when a user clicks "Build" on the website, the system **automatically creates that workflow pipeline** behind the scenes without anyone manually doing it.
+
+---
+
+## 🧩 Understanding Each Component
+
+### 1. 🖥️ The UI (Frontend / Gen UI)
+This is the website the user interacts with. When a user designs a workflow and clicks **"Build"**, the UI doesn't do the heavy lifting itself — it just **publishes an event** (sends a notification message) saying *"Hey, someone just clicked Build!"*
+
+> **Analogy:** Like pressing the "Order" button on Swiggy. You don't cook the food — you just send the signal.
+
+---
+
+### 2. 📨 Kafka (The Messaging System)
+When the UI publishes a build event, it doesn't directly call any service. Instead, it drops the message into **Kafka**.
+
+Kafka is like a **post office with multiple mailboxes (topics)**. Different types of events go into different mailboxes:
+- Build events → "build topic" mailbox
+- Run events → "run topic" mailbox
+- Approved events → "approved topic" mailbox
+
+Services that care about a particular event **subscribe** to that mailbox and get notified when a message arrives.
+
+> **Analogy:** Like a WhatsApp group. You post a message (event), and everyone in the group (subscribed services) receives it. Different groups for different purposes.
+
+---
+
+### 3. 🧠 Genesis Hub / Genesis Core (Java Service)
+This is the **main coordinator** — the brain of the system. It is built in **Java**.
+
+What it does:
+- **Listens to Kafka** for incoming events (build, run, approved, etc.)
+- When it receives a build event, it extracts the **metadata JSON** (all the details about the workflow — nodes, configurations, etc.)
+- **Saves partial information** into the PostgreSQL database
+- **Forwards the full JSON payload** to the DAG Generator service via a REST API call
+
+> **Analogy:** Like a project manager who receives a client requirement (Kafka event), logs it (saves to DB), and then assigns it to the developer (DAG Generator) to actually do the work.
+
+---
+
+### 4. 🐍 Airflow DAG Generator Service (Python / FastAPI)
+This is a separate **Python-based microservice** that does the actual work of creating the DAG in Airflow.
+
+What it does:
+- **Exposes a REST API endpoint** (built using FastAPI) that waits to receive instructions
+- When the Genesis Core calls this endpoint with a JSON payload, it reads the workflow details
+- **Creates the DAG** — the actual automated workflow in Airflow with all the nodes/steps
+- **Sends back a response** (DAG ID, status) to Genesis Core so the database can be updated
+
+> **Analogy:** Like a skilled chef who waits for the order slip (REST call), prepares the dish (creates the DAG), and sends back a "dish ready" receipt (DAG ID response).
+
+---
+
+### 5. 🗄️ PostgreSQL Database
+This is where all persistent data is stored — metadata, event info, node payloads, DAG IDs, statuses.
+
+The Genesis Core both reads from and writes to this database throughout the process.
+
+> **Analogy:** Like the restaurant's order management system — everything gets logged and tracked here.
+
+---
+
+## 🔄 The Full Flow — Step by Step
+
+Here's the **complete journey** from a user clicking "Build" to a DAG being created:
+
+```
+User clicks "Build" on UI
+        ↓
+UI publishes a Build Event to Kafka (build topic)
+        ↓
+Genesis Hub is listening to Kafka → receives the event
+        ↓
+Genesis Hub extracts the metadata JSON from the event
+        ↓
+Genesis Hub saves partial data into PostgreSQL DB
+        ↓
+Genesis Hub makes a REST API call → sends full JSON to DAG Generator
+        ↓
+DAG Generator (Python/FastAPI) receives the JSON
+        ↓
+DAG Generator creates the DAG in Airflow (with all nodes/steps)
+        ↓
+DAG Generator sends back DAG ID + status via POST API
+        ↓
+Genesis Core receives the response → updates PostgreSQL DB
+```
+
+---
+
+## ❓ The Big Confusion in the Meeting — Explained
+
+The team had a major misunderstanding that Swati kept trying to correct. Here's what it was:
+
+### ❌ What Namrata initially thought:
+> The DAG Generator service should have a **GET endpoint** on the Genesis Core, and the DAG Generator would **keep calling** that endpoint to check if there's a new build event waiting.
+
+**Why this is wrong:**
+- This is called **polling** — constantly asking "anything new? anything new? anything new?" — which is inefficient and wasteful
+- The DAG Generator would have no idea *when* to call — every second? every minute?
+- It creates unnecessary load on the system
+
+### ✅ What Swati clarified (the correct approach):
+> The Genesis Core should **actively push** the data to the DAG Generator the moment it receives a build event. The DAG Generator just needs to **sit and wait** with an open REST endpoint — it gets called only when needed.
+
+**Why this is better:**
+- More efficient — the DAG Generator only wakes up when there's actual work
+- Event-driven — the system reacts to things as they happen
+- No wasted calls
+
+> **Analogy (Polling - Wrong):** Calling a restaurant every 5 minutes asking "Is my food ready?" — annoying and wasteful.
+> **Analogy (Push - Correct):** The restaurant calls *you* when the food is ready — efficient and clean.
+
+---
+
+## 🔀 Build Phase vs Run Phase — What's the Difference?
+
+This is another key concept discussed. The system handles two different phases:
+
+### 🔨 Build Phase
+- User designs a workflow and clicks **"Build"**
+- This is the **first time** this workflow is being set up
+- The DAG doesn't exist yet — it needs to be **created from scratch**
+- Genesis Core receives the build event → calls DAG Generator → DAG is created → DAG ID saved to DB
+- **DAG Generator IS called** in this phase
+
+### ▶️ Run Phase
+- User clicks **"Run"** to actually execute a previously built workflow
+- The DAG **already exists** in Airflow (created during Build phase)
+- The system just needs the **node payloads** (the actual data/inputs for each step)
+- Genesis Core saves node payloads to DB and merges with existing DAG info
+- **DAG Generator is NOT called again** — no need to recreate the DAG
+
+| | Build Phase | Run Phase |
+|---|---|---|
+| DAG exists? | ❌ No — must create it | ✅ Yes — already there |
+| Calls DAG Generator? | ✅ Yes | ❌ No |
+| Kafka Topic | Build/Approved topic | Run/Task topic |
+| DB Action | Save metadata + DAG ID | Save node payloads |
+
+> **Analogy:** Build phase = building a factory (one time). Run phase = operating the factory to produce goods (many times). You don't rebuild the factory every time you want to make a product.
+
+---
+
+## 🗺️ How Does the Hub Know Build vs Run?
+
+Sentil asked a great question — *how does the Genesis Hub know if an incoming Kafka message is a build event or a run event?*
+
+Two ways:
+1. **Different Kafka Topics** — Build events come on one topic, run events on another. The Hub subscribes to both but handles them differently.
+2. **Event Type field** — Even if they're on the same topic, the message itself contains an `event_type` field (like `"type": "build"` or `"type": "run"`) which the Hub checks.
+
+> **Analogy:** Like receiving two different types of emails — you can either have separate inboxes (different Kafka topics) or one inbox but with labels/tags (event type field) to tell them apart.
+
+---
+
+## 🛠️ Technical Terms Explained Simply
+
+| Term | Simple Explanation |
+|---|---|
+| **REST API** | A way for two services to talk over the internet using HTTP. Like a waiter taking your order to the kitchen. |
+| **GET endpoint** | A REST call that *asks for* data — "give me the info" |
+| **POST endpoint** | A REST call that *sends* data — "here is the info" |
+| **FastAPI** | A Python tool/framework to quickly build REST APIs |
+| **Kafka** | A messaging system where services publish and subscribe to events |
+| **Kafka Topic** | Like a mailbox or a WhatsApp group — events of a certain type go here |
+| **DAG** | A workflow with steps that run in a specific order (like a flowchart) |
+| **Airflow** | A tool that runs and manages DAGs (automated workflows) |
+| **Microservice** | A small, independent service that does one specific job |
+| **PostgreSQL** | A relational database — stores structured data in tables |
+| **Payload** | The actual data/content inside a message or API call |
+| **Event-driven architecture** | A system design where services react to events (things happening) instead of constantly checking |
+| **Polling** | Repeatedly asking "is there anything new?" — inefficient |
+| **Push** | Being notified only when something happens — efficient |
+
+---
+
+## ✅ Who Does What — Action Items
+
+| Person | Task |
+|---|---|
+| **Namrata** | Write the REST call in Java (Genesis Hub) to push payload to DAG Generator. Also write a POST endpoint to receive DAG status back and update DB. |
+| **Sentil** | Build the FastAPI REST endpoint in the Python DAG Generator. Draft a detailed architecture document. |
+| **Namrata + Sentil** | Connect separately to agree on exact database payload structure and node details. |
+| **Sanya** | Schedule a NiFi review call with Umesh, Nitin + 2 customer-side people that afternoon. |
+
+---
+
+## 🎓 The Key Lesson From This Meeting
+
+The whole meeting boiled down to one architectural principle:
+
+> **Don't poll. Use push.**
+
+Instead of the DAG Generator repeatedly asking the Genesis Core "do you have data for me?", the Genesis Core should push the data to the DAG Generator the moment it's available. This is the foundation of **event-driven microservice architecture** — services react to events, they don't sit and ask.
+
+---
+
+Want me to go even deeper on any specific concept — like how Kafka works, what FastAPI is, or how Airflow DAGs are structured?
