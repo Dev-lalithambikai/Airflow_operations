@@ -1,0 +1,24 @@
+
+
+Based on the review during the call, here are the specific updates requested for the architecture document:
+
+* **Rephrase the Build vs. Run Phase:** Explicitly update Section 2 to clarify that the "Build Phase" only creates a *skeletal* DAG structure in Airflow. The actual mapping of payloads to static NiFi process groups should be explicitly documented as happening during the "Run Phase" to accommodate dynamic payload changes.
+* **Maintain a Living Document:** Update the wiki/documentation comprehensively with the discussed understandings so that any team member referring to it gets an accurate picture of the pipeline.
+* **Clarify Trigger Mechanisms:** Provide a clearer explanation in the document regarding the "Topic Watch" trigger and how Kafka events initiate the run phase.
+* **Include Python Processors (GenProc):** Update the execution phase diagrams and flow definitions to include custom Python code (GenProc) functioning as independent API endpoints.
+* **Document CyberArk Integration:** Update the security section to reflect that hardcoded passwords will not be exposed in the database; instead, the system will use a credential service (like CyberArk) to retrieve secrets dynamically at runtime.
+
+Would you like me to help you draft the specific revised paragraphs for your documentation based on these feedback points?
+
+1. Rephrase Build Phase vs Run Phase sections
+The team suggested explicitly calling out "build phase" and "run phase" separately in the documentation, rather than mixing them. The current description needed rewording to clearly reflect that process groups are static/existing entities in NiFi, and a skeletal DAG is created in build phase, while payloads are mapped during run phase.
+2. Process Groups Clarification
+It was confirmed that the 16 NiFi process groups are pre-existing static entities in the NiFi environment — not dynamically created. The documentation needed to reflect this correction.
+3. Payload Mapping — Move to Run Phase
+Originally there was consideration of mapping executable IDs to process groups during build phase. The team agreed this mapping should happen during run phase only, since payloads can change between build and run triggers.
+4. Topic Watch Trigger — Needs Clarification
+The "topic watch" trigger mechanism (NiFi consuming Kafka to trigger build/run) was flagged as unclear and potentially incorrect. The team agreed to park it and reconfirm with Nitin before documenting it further.
+5. GenProc / Python API Nodes in DAG
+The suggestion was to explicitly call out that DAG nodes aren't only NiFi nodes — they can also be GenProc (custom Python/Java API endpoints). The documentation should expand on this rather than lumping everything under "Python processor."
+6. File Watch is Run-Phase Only
+It was clarified that the file watcher trigger is exclusively for the run phase, not build phase. The documentation needed this correction.
